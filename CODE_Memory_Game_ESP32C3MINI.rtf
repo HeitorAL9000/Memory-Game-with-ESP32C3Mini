@@ -1,0 +1,283 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2868
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\paperw11900\paperh16840\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 /*\
+  ESP32-C3 Super Mini Simon Game + 0.96" SSD1306 128x64 OLED (I2C)\
+  - 5 LEDs, 5 Buttons, 1 Passive Buzzer\
+  - OLED shows round, best score, prompts\
+  - Sad trombone on loss, no win sound\
+\
+  Note: This sketch defaults to I2C on GPIO 8/9 (USB D-/D+). Unplug SDA/SCL\
+  from pins 8/9 when UPLOADING. For a USB-safe mapping, set USE_USB_PINS false\
+  and move OLED to 20/21 (see pin block below).\
+*/\
+\
+#include <Arduino.h>\
+#include <Wire.h>\
+#include <Adafruit_GFX.h>\
+#include <Adafruit_SSD1306.h>\
+\
+// ---------------- Pin mapping options ----------------\
+#define USE_USB_PINS true  // true = OLED on 8/9 (unplug to upload). false = OLED on 20/21.\
+\
+#if USE_USB_PINS\
+  // Plan B (default): Keep LEDs+buttons as before; OLED on 8/9\
+  const int ledPins[5] = \{1, 2, 3, 4, 5\};\
+  const int btnPins[5] = \{6, 7, 10, 20, 21\};\
+  const int BUZZER_PIN = 0;\
+  const int I2C_SDA = 8;\
+  const int I2C_SCL = 9;\
+#else\
+  // Plan A (USB-safe during play): OLED on 20/21, remap buttons to avoid 20/21\
+  const int ledPins[5] = \{1, 2, 3, 4, 5\};\
+  const int btnPins[5] = \{6, 7, 10, 8, 9\}; // <- if this causes USB issues, swap LEDs to other pins instead\
+  const int BUZZER_PIN = 0;\
+  const int I2C_SDA = 20;\
+  const int I2C_SCL = 21;\
+#endif\
+\
+// ---------------- Display setup ----------------\
+#define SCREEN_WIDTH 128\
+#define SCREEN_HEIGHT 64\
+#define OLED_RESET    -1\
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);\
+\
+// ---------------- Notes per color (Hz) ----------------\
+const int noteHz[5] = \{523, 587, 659, 698, 784\}; // C5,D5,E5,F5,G5\
+\
+// ---------------- Timing ----------------\
+const uint8_t  MAX_STEPS = 64;\
+const uint16_t STEP_ON_MS_BASE = 350;\
+const uint16_t STEP_OFF_MS = 120;\
+const uint16_t INPUT_LIGHT_MS = 180;\
+const uint16_t DEBOUNCE_MS = 25;\
+const uint16_t BETWEEN_ROUNDS_MS = 600;\
+const uint16_t IDLE_BREATH_MS = 1200;\
+\
+// ---------------- Game state ----------------\
+enum State \{ IDLE, SHOW_SEQUENCE, PLAYER_TURN, LOSE \};\
+State state = IDLE;\
+uint8_t seq[MAX_STEPS];\
+uint8_t seqLen = 0;\
+uint8_t inputIndex = 0;\
+uint32_t tNow, tState, tStep;\
+uint8_t showIndex = 0;\
+bool showOn = false;\
+uint32_t lastBtnTime[5] = \{0\};\
+bool lastBtnLevel[5] = \{1,1,1,1,1\}; // pull-up idle high\
+uint8_t bestScore = 0;\
+\
+// ---------------- Tone helpers ----------------\
+void toneESP32(int pin, double freq, int durMs = 0) \{\
+  unsigned long f = (unsigned long)(freq < 1 ? 1 : (freq > 100000 ? 100000 : freq));\
+  if (durMs > 0) \{\
+    tone(pin, (unsigned int)f, durMs);\
+    delay(durMs);\
+    noTone(pin);\
+  \} else \{\
+    tone(pin, (unsigned int)f);\
+  \}\
+\}\
+void noToneESP32(int pin) \{ noTone(pin); \}\
+\
+// ---------------- Utils ----------------\
+void allLeds(bool on)\{ for(int i=0;i<5;i++) digitalWrite(ledPins[i], on?HIGH:LOW); \}\
+void flashAll(uint8_t times,uint16_t onMs,uint16_t offMs)\{\
+  for(uint8_t i=0;i<times;i++)\{ allLeds(true); delay(onMs); allLeds(false); delay(offMs); \}\
+\}\
+uint16_t stepOnTimeForRound(uint8_t roundLen)\{\
+  int t = STEP_ON_MS_BASE - (int)roundLen * 6;\
+  if (t < 180) t = 180;\
+  return (uint16_t)t;\
+\}\
+void appendRandomStep()\{ seq[seqLen++] = esp_random() % 5; \}\
+void resetGame()\{\
+  if (seqLen > bestScore) bestScore = seqLen; // record best achieved length\
+  seqLen = 0; inputIndex = 0; showIndex = 0; showOn = false; state = IDLE; tState = millis();\
+\}\
+void startColor(uint8_t idx)\{ digitalWrite(ledPins[idx], HIGH); toneESP32(BUZZER_PIN, noteHz[idx]); \}\
+void stopColor(uint8_t idx)\{ digitalWrite(ledPins[idx], LOW); noToneESP32(BUZZER_PIN); \}\
+\
+// Sad Trombone (Bb4\uc0\u8594 G4\u8594 Eb4\u8594 C4)\
+void playSadTrombone()\{\
+  const int trombone[4] = \{466,392,311,262\};\
+  const int holdMs=220, slideMs=120;\
+  for(int n=0;n<4;n++)\{\
+    toneESP32(BUZZER_PIN, trombone[n]);\
+    allLeds(true); delay(holdMs); allLeds(false);\
+    if(n<3)\{\
+      int f0=trombone[n], f1=trombone[n+1]-20, steps=18;\
+      for(int i=0;i<steps;i++)\{ double f=f0+(double)(f1-f0)*i/(steps-1); toneESP32(BUZZER_PIN, f); delay(slideMs/steps); \}\
+    \}\
+  \}\
+  noToneESP32(BUZZER_PIN);\
+\}\
+\
+// Buttons (debounced, edge)\
+int readButtonPressed()\{\
+  tNow = millis();\
+  for(int i=0;i<5;i++)\{\
+    bool level = digitalRead(btnPins[i]);\
+    if(level != lastBtnLevel[i])\{\
+      if(tNow - lastBtnTime[i] >= DEBOUNCE_MS)\{\
+        lastBtnTime[i] = tNow;\
+        lastBtnLevel[i] = level;\
+        if(level == LOW) return i;\
+      \}\
+    \}\
+  \}\
+  return -1;\
+\}\
+\
+// ---------------- OLED UI ----------------\
+void oledHeader(const char* title)\{\
+  display.clearDisplay();\
+  display.setTextSize(1);\
+  display.setTextColor(SSD1306_WHITE);\
+  display.setCursor(0,0);\
+  display.print(title);\
+  display.drawLine(0,10,127,10,SSD1306_WHITE);\
+\}\
+\
+void oledShowIdle()\{\
+  oledHeader("SIMON 5 (ESP32-C3)");\
+  display.setCursor(0,16);\
+  display.print("Press any button");\
+  display.setCursor(0,26);\
+  display.print("to start");\
+  display.setCursor(0,44);\
+  display.print("Best: ");\
+  display.print(bestScore);\
+  display.display();\
+\}\
+\
+void oledShowRound()\{\
+  oledHeader("Watch the sequence");\
+  display.setCursor(0,16);\
+  display.print("Round len: ");\
+  display.print(seqLen);\
+  display.setCursor(0,26);\
+  display.print("Speed: ");\
+  display.print(stepOnTimeForRound(seqLen));\
+  display.print("ms");\
+  display.display();\
+\}\
+\
+void oledShowTurn()\{\
+  oledHeader("Your turn");\
+  display.setCursor(0,16);\
+  display.print("Repeat len: ");\
+  display.print(seqLen);\
+  display.setCursor(0,26);\
+  display.print("Index: ");\
+  display.print(inputIndex+1);\
+  display.setCursor(0,44);\
+  display.print("Best: ");\
+  display.print(bestScore);\
+  display.display();\
+\}\
+\
+void oledShowLose()\{\
+  oledHeader("You lost :(");\
+  display.setCursor(0,16);\
+  display.print("Score: ");\
+  display.print(seqLen);\
+  display.setCursor(0,26);\
+  display.print("Best: ");\
+  display.print(bestScore);\
+  display.setCursor(0,44);\
+  display.print("Sad trombone...");\
+  display.display();\
+\}\
+\
+// ---------------- Setup/Loop ----------------\
+void setup()\{\
+  for(int i=0;i<5;i++)\{\
+    pinMode(ledPins[i], OUTPUT); digitalWrite(ledPins[i], LOW);\
+    pinMode(btnPins[i], INPUT_PULLUP);\
+  \}\
+  pinMode(BUZZER_PIN, OUTPUT);\
+\
+  // I2C + OLED\
+  Wire.begin(I2C_SDA, I2C_SCL);\
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))\{\
+    // If OLED not found, continue game headless\
+  \} else \{\
+    display.clearDisplay(); display.display();\
+  \}\
+\
+  randomSeed(esp_random());\
+  flashAll(1, 200, 100);\
+  tState = millis();\
+  oledShowIdle();\
+\}\
+\
+void loop()\{\
+  tNow = millis();\
+\
+  switch(state)\{\
+    case IDLE:\{\
+      // simple breathe on LED5\
+      int w=4;\
+      float phase = (tNow % IDLE_BREATH_MS) / (float)IDLE_BREATH_MS;\
+      int pwm = (int)(255.0*(0.5f - 0.5f*cosf(phase*2*PI)));\
+      digitalWrite(ledPins[w], pwm > 128 ? HIGH : LOW);\
+\
+      int pressed = readButtonPressed();\
+      if(pressed >= 0)\{\
+        allLeds(false);\
+        seqLen = 0;\
+        appendRandomStep();\
+        inputIndex = 0; showIndex = 0; showOn = false;\
+        state = SHOW_SEQUENCE; tStep = tNow;\
+        oledShowRound();\
+      \}\
+    \} break;\
+\
+    case SHOW_SEQUENCE:\{\
+      uint16_t onMs = stepOnTimeForRound(seqLen);\
+      if(!showOn)\{\
+        startColor(seq[showIndex]); showOn = true; tStep = tNow;\
+      \} else if(tNow - tStep >= onMs)\{\
+        stopColor(seq[showIndex]); showOn = false; tStep = tNow; showIndex++;\
+        if(showIndex >= seqLen)\{\
+          state = PLAYER_TURN; inputIndex = 0; tState = tNow;\
+          oledShowTurn();\
+        \}\
+      \} else if(!showOn && (tNow - tStep >= STEP_OFF_MS) && (showIndex < seqLen))\{\
+        startColor(seq[showIndex]); showOn = true; tStep = tNow;\
+      \}\
+    \} break;\
+\
+    case PLAYER_TURN:\{\
+      int pressed = readButtonPressed();\
+      if(pressed >= 0)\{\
+        startColor(pressed); delay(INPUT_LIGHT_MS); stopColor(pressed);\
+        oledShowTurn();\
+        if(pressed == seq[inputIndex])\{\
+          inputIndex++;\
+          if(inputIndex >= seqLen)\{\
+            delay(BETWEEN_ROUNDS_MS);\
+            appendRandomStep(); showIndex = 0; showOn = false;\
+            state = SHOW_SEQUENCE; tState = millis();\
+            oledShowRound();\
+          \}\
+        \} else \{\
+          state = LOSE; tState = millis();\
+          oledShowLose();\
+        \}\
+      \}\
+    \} break;\
+\
+    case LOSE:\{\
+      playSadTrombone();\
+      flashAll(2, 120, 120);\
+      resetGame();\
+      oledShowIdle();\
+    \} break;\
+  \}\
+\}}
