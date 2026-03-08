@@ -8,7 +8,7 @@ Gerber Files available too (still waiting for the PCBs to arrive from JLCPCB to 
 The game consist in a simple colour memory game where you see a LED light up and press the corresponding button. 
 Each time you make it it adds new colour to the sequence until you fail. It sings a sort of Sad Trombone tune when you loose.
 If you solder the ESP without programming (or want ot change the code later) you need to enable the SW2 for programming, this will disconnect the OLED from the ESP. This is because the ESP uses the same I2c pins for the LCD and programming.
-
+Once I have the first board built I'll upload a few photos of it ;-)
 All parts are easily available on the internet, Aliexpress, Ebay and other electronics parts retailers like BitsBox, Pihut etc.
 Hope you like it and have fun building this.
 
