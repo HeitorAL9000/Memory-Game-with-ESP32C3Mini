@@ -13,3 +13,5 @@ All parts are easily available on the internet, Aliexpress, Ebay and other elect
 Hope you like it and have fun building this.
 
 Disclaimer - I'm not liable for anything that may happen when you handle the battery, electronics parts and solder. Please don't build this if you ain't confident enough. Ask for help ;-)
+
+![prototype_mem_game](https://github.com/user-attachments/assets/9a345ab1-32d8-4850-8b4d-e17f02a5d0a6)
