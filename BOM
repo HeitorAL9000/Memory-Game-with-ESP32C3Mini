@@ -1,4 +1,4 @@
-6x 220 ohm resistors
+6x 220 ohm resistors (schematic says 100 ohm for buzzer but it's a typo)
 1x ESP32C3Mini
 1x 0.96' 128x64 OLED LCD (if you use larger size you need to check the connections for ground and power and the code probably needs changing)
 5x tactile switches and caps
